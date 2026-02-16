@@ -1,10 +1,11 @@
 # Test22 – NodeMCU (ESP8266) + OLED
 
 ## Board / Verdrahtung
-Siehe: `docs/board_nodemcu_oled.md`
+- Dokumentation: [docs/board_nodemcu_oled.md](docs/board_nodemcu_oled.md)
 
 ## Sketches
-- OLED Uptime: `sketches/oled_uptime/oled_uptime.ino`
+- OLED Uptime: [sketches/oled_uptime/oled_uptime.ino](sketches/oled_uptime/oled_uptime.ino)
+- OLED Buddy: [sketches/oled_buddy/oled_buddy.ino](sketches/oled_buddy/oled_buddy.ino)
 
 ## Arduino IDE Einstellungen
 - Board: NodeMCU 1.0 (ESP-12E Module)
