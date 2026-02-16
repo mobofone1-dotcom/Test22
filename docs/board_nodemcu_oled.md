@@ -1,13 +1,13 @@
-# NodeMCU 1.0 (ESP-12E) + OLED (SSD1306) – Notizen
+# NodeMCU 1.0 (ESP-12E / ESP8266) + OLED (SSD1306)
 
-## Serielle Ausgabe
-- Baudrate: 115200
-
-## OLED / I2C
-- OLED I2C-Adresse: 0x3C
-- Funktionierende Pins (gefunden):
+## Confirmed setup
+- Board: NodeMCU 1.0 (ESP-12E / ESP8266)
+- OLED I2C address: `0x3C`
+- Working I2C pins:
   - SDA = D5 (GPIO14)
   - SCL = D6 (GPIO12)
+- Arduino IDE Serial Monitor baud: `115200`
 
-## Arduino IDE
-- Board: NodeMCU 1.0 (ESP-12E Module)
+## Troubleshooting
+- Garbled serial text usually means the baud rate is wrong.
+- `no I2C devices found` usually means SDA/SCL are wrong, or GND/3V3 is missing.
