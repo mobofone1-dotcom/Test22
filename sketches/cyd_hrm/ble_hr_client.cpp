@@ -1,5 +1,8 @@
 #include "ble_hr_client.h"
 
+#include <cctype>
+#include <cstring>
+
 #if defined(ESP32)
 #include "freertos/FreeRTOS.h"
 #include "freertos/portmacro.h"
@@ -14,14 +17,55 @@ static portMUX_TYPE s_hr_mux = portMUX_INITIALIZER_UNLOCKED;
 namespace {
 constexpr uint16_t kHrServiceUuid16 = 0x180D;
 constexpr uint16_t kHrMeasurementCharUuid16 = 0x2A37;
-constexpr uint32_t kScanDurationMs = 7000;
+constexpr uint32_t kScanDurationMs = 6000;
 constexpr uint32_t kScanPauseMs = 1000;
 
 BleHrClient* g_instance = nullptr;
 
 NimBLEClient* g_client = nullptr;
 NimBLEAdvertisedDevice* g_target = nullptr;
+int g_target_priority = 0;
 bool g_scan_running = false;
+
+bool equalsIgnoreCase(const char* a, const char* b) {
+  if (a == nullptr || b == nullptr) {
+    return false;
+  }
+  while (*a != '\0' && *b != '\0') {
+    if (std::tolower(static_cast<unsigned char>(*a)) != std::tolower(static_cast<unsigned char>(*b))) {
+      return false;
+    }
+    ++a;
+    ++b;
+  }
+  return *a == '\0' && *b == '\0';
+}
+
+bool containsIgnoreCase(const char* haystack, const char* needle) {
+  if (haystack == nullptr || needle == nullptr || *needle == '\0') {
+    return false;
+  }
+  const size_t hay_len = strlen(haystack);
+  const size_t needle_len = strlen(needle);
+  if (needle_len > hay_len) {
+    return false;
+  }
+
+  for (size_t i = 0; i + needle_len <= hay_len; ++i) {
+    bool match = true;
+    for (size_t j = 0; j < needle_len; ++j) {
+      if (std::tolower(static_cast<unsigned char>(haystack[i + j])) !=
+          std::tolower(static_cast<unsigned char>(needle[j]))) {
+        match = false;
+        break;
+      }
+    }
+    if (match) {
+      return true;
+    }
+  }
+  return false;
+}
 
 class HrClientCallbacks : public NimBLEClientCallbacks {
   void onDisconnect(NimBLEClient* client, int reason) override {
@@ -38,17 +82,42 @@ class HrScanCallbacks : public NimBLEScanCallbacks {
     if (g_instance == nullptr || device == nullptr) {
       return;
     }
-    if (!device->isAdvertisingService(NimBLEUUID((uint16_t)kHrServiceUuid16))) {
+    g_instance->onAdvertisementSeen(device);
+
+    const bool adv_hrs = device->isAdvertisingService(NimBLEUUID((uint16_t)kHrServiceUuid16));
+    const bool has_name = device->haveName();
+    const char* name = has_name ? device->getName().c_str() : "";
+    int priority = 0;
+
+    if (has_name && equalsIgnoreCase(name, "55825-1")) {
+      priority = 3;
+    } else if (adv_hrs) {
+      priority = 2;
+    } else if (has_name &&
+               (containsIgnoreCase(name, "MAGENE") || containsIgnoreCase(name, "H64") ||
+                containsIgnoreCase(name, "HRM"))) {
+      priority = 1;
+    }
+
+    if (priority == 0) {
       return;
     }
 
-    if (g_target != nullptr) {
-      delete g_target;
-      g_target = nullptr;
+    if (g_target == nullptr || priority > g_target_priority ||
+        (priority == g_target_priority && device->getRSSI() > g_target->getRSSI())) {
+      if (g_target != nullptr) {
+        delete g_target;
+      }
+      g_target = new NimBLEAdvertisedDevice(*device);
+      g_target_priority = priority;
+      Serial.printf("[HRM] Candidate selected: %s name='%s' rssi=%d\n",
+                    device->getAddress().toString().c_str(), has_name ? name : "",
+                    device->getRSSI());
     }
-    g_target = new NimBLEAdvertisedDevice(*device);
-    g_instance->loop();
-    NimBLEDevice::getScan()->stop();
+
+    if (priority >= 3 && NimBLEDevice::getScan()->isScanning()) {
+      NimBLEDevice::getScan()->stop();
+    }
   }
 
   void onScanEnd(const NimBLEScanResults& results, int reason) override {
@@ -90,6 +159,7 @@ void BleHrClient::begin() {
   next_connect_ms_ = millis();
   backoff_ms_ = 1000;
   target_found_ = false;
+  g_target_priority = 0;
 
 #ifdef HR_DUMMY_MODE
   next_dummy_ms_ = millis() + 1000;
@@ -100,7 +170,7 @@ void BleHrClient::begin() {
   NimBLEDevice::init("CYD-HRM");
   NimBLEDevice::setPower(ESP_PWR_LVL_P9);
   NimBLEScan* scan = NimBLEDevice::getScan();
-  scan->setScanCallbacks(&g_scan_callbacks, false);
+  scan->setScanCallbacks(&g_scan_callbacks, true);
   scan->setInterval(80);
   scan->setWindow(48);
   scan->setActiveScan(true);
@@ -181,13 +251,15 @@ void BleHrClient::loop() {
   if (state_ == HrConnState::SCANNING && !g_scan_running) {
     target_found_ = false;
     g_scan_running = true;
-    Serial.println("[HRM] Scanning for Heart Rate Service 0x180D...");
+    g_target_priority = 0;
+    Serial.println("[HRM] Scanning for HR candidates...");
     NimBLEDevice::getScan()->start(kScanDurationMs / 1000, false, true);
     next_scan_ms_ = now + kScanDurationMs + kScanPauseMs;
   }
 
   if (g_target != nullptr && (state_ == HrConnState::SCANNING || state_ == HrConnState::DISCONNECTED)) {
     target_found_ = true;
+    next_connect_ms_ = now;
     setState(HrConnState::CONNECTING);
   }
 
@@ -216,8 +288,17 @@ void BleHrClient::loop() {
 
     NimBLERemoteService* service = g_client->getService(kHrServiceUuid16);
     NimBLERemoteCharacteristic* hr_char = service ? service->getCharacteristic(kHrMeasurementCharUuid16) : nullptr;
-    if (service == nullptr || hr_char == nullptr || !hr_char->canNotify()) {
-      Serial.println("[HRM] Missing HR characteristic/notify");
+    if (service == nullptr) {
+      Serial.println("[HRM] Connected to candidate but no HRS (0x180D). Disconnect.");
+      g_client->disconnect();
+      setState(HrConnState::DISCONNECTED);
+      next_scan_ms_ = now + backoff_ms_;
+      backoff_ms_ = min<uint32_t>(backoff_ms_ * 2U, 30000U);
+      return;
+    }
+
+    if (hr_char == nullptr || !hr_char->canNotify()) {
+      Serial.println("[HRM] Missing 0x2A37 notify characteristic");
       g_client->disconnect();
       setState(HrConnState::DISCONNECTED);
       next_scan_ms_ = now + backoff_ms_;
@@ -234,6 +315,7 @@ void BleHrClient::loop() {
       return;
     }
 
+    Serial.println("[HRM] HRS ok, subscribed 0x2A37");
     Serial.printf("[HRM] Free heap after subscribe: %u\n", ESP.getFreeHeap());
     setState(HrConnState::SUBSCRIBED);
     backoff_ms_ = 1000;
@@ -249,6 +331,24 @@ void BleHrClient::loop() {
 #endif
 }
 
+void BleHrClient::onAdvertisementSeen(const NimBLEAdvertisedDevice* device) {
+  if (device == nullptr) {
+    return;
+  }
+  const bool has_name = device->haveName();
+  const char* name = has_name ? device->getName().c_str() : "";
+  const bool adv_hrs = device->isAdvertisingService(NimBLEUUID((uint16_t)kHrServiceUuid16));
+
+  HRM_LOCK();
+  snprintf(last_seen_name_, sizeof(last_seen_name_), "%s", name);
+  last_seen_rssi_ = device->getRSSI();
+  HRM_UNLOCK();
+
+  Serial.printf("[HRM] ADV %s rssi=%d conn=%d name='%s' advHRS=%d\n",
+                device->getAddress().toString().c_str(), device->getRSSI(),
+                device->isConnectable() ? 1 : 0, has_name ? name : "", adv_hrs ? 1 : 0);
+}
+
 void BleHrClient::resetMetrics() {
   HRM_LOCK();
   start_ms_ = millis();
@@ -257,6 +357,8 @@ void BleHrClient::resetMetrics() {
   min_bpm_ = 0;
   max_bpm_ = 0;
   last_hr_ms_ = 0;
+  snprintf(last_seen_name_, sizeof(last_seen_name_), "");
+  last_seen_rssi_ = 0;
   HRM_UNLOCK();
   Serial.println("[HRM] Metrics reset");
 }
@@ -271,6 +373,8 @@ HrSnapshot BleHrClient::snapshot() const {
   snap.start_ms = start_ms_;
   snap.last_hr_ms = last_hr_ms_;
   snap.state = state_;
+  snprintf(snap.last_seen_name, sizeof(snap.last_seen_name), "%s", last_seen_name_);
+  snap.last_seen_rssi = last_seen_rssi_;
   HRM_UNLOCK();
   return snap;
 }

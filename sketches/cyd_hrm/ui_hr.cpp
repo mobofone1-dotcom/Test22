@@ -6,6 +6,7 @@ BleHrClient* g_client = nullptr;
 lv_obj_t* g_bpm_label = nullptr;
 lv_obj_t* g_minmax_label = nullptr;
 lv_obj_t* g_status_label = nullptr;
+lv_obj_t* g_seen_label = nullptr;
 
 const char* stateText(HrConnState state) {
   switch (state) {
@@ -55,7 +56,12 @@ void init(BleHrClient* client) {
   g_status_label = lv_label_create(scr);
   lv_obj_set_style_text_font(g_status_label, &lv_font_montserrat_14, 0);
   lv_label_set_text(g_status_label, "TIME 00:00:00   disconnected");
-  lv_obj_align(g_status_label, LV_ALIGN_BOTTOM_MID, 0, -16);
+  lv_obj_align(g_status_label, LV_ALIGN_BOTTOM_MID, 0, -30);
+
+  g_seen_label = lv_label_create(scr);
+  lv_obj_set_style_text_font(g_seen_label, &lv_font_montserrat_14, 0);
+  lv_label_set_text(g_seen_label, "LAST -- RSSI --");
+  lv_obj_align(g_seen_label, LV_ALIGN_BOTTOM_LEFT, 8, -8);
 
   lv_obj_t* btn = lv_button_create(scr);
   lv_obj_set_size(btn, 86, 34);
@@ -85,6 +91,12 @@ void refresh(const HrSnapshot& snap, uint32_t now_ms) {
   formatRuntime(runtime, sizeof(runtime), elapsed);
 
   lv_label_set_text_fmt(g_status_label, "TIME %s   %s", runtime, stateText(snap.state));
+
+  if (g_seen_label != nullptr && snap.last_seen_name[0] != '\0') {
+    lv_label_set_text_fmt(g_seen_label, "LAST %s RSSI %d", snap.last_seen_name, snap.last_seen_rssi);
+  } else if (g_seen_label != nullptr) {
+    lv_label_set_text(g_seen_label, "LAST -- RSSI --");
+  }
 }
 
 }  // namespace ui_hr
