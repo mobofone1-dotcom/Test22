@@ -1,110 +1,240 @@
 #include <Arduino.h>
-#include <SPI.h>
 #include <TFT_eSPI.h>
-#include <XPT2046_Touchscreen.h>
-#include <lvgl.h>
 
-#include "ble_hr_client.h"
-#include "ui_hr.h"
+#include <BLEAdvertisedDevice.h>
+#include <BLEClient.h>
+#include <BLEDevice.h>
+#include <BLEScan.h>
 
-// #define HR_DUMMY_MODE
+// Zielgerät
+static const char* TARGET_MAC = "c1:3c:43:e3:5b:3e";
+static const char* TARGET_NAME = "55825-1";  // nur Anzeige
 
-namespace {
-constexpr uint16_t TFT_HOR_RES = 320;
-constexpr uint16_t TFT_VER_RES = 240;
-
-constexpr int TOUCH_SCK = 25;
-constexpr int TOUCH_MOSI = 32;
-constexpr int TOUCH_MISO = 39;
-constexpr int TOUCH_CS = 33;
-constexpr int TOUCH_IRQ = 36;
+// Standard BLE UUIDs (Bluetooth SIG)
+static BLEUUID HR_SERVICE((uint16_t)0x180D);
+static BLEUUID HR_MEAS_CHAR((uint16_t)0x2A37);
+static BLEUUID BAT_SERVICE((uint16_t)0x180F);
+static BLEUUID BAT_LEVEL_CHAR((uint16_t)0x2A19);
 
 TFT_eSPI tft;
-SPIClass touch_spi(HSPI);
-XPT2046_Touchscreen touch(TOUCH_CS, TOUCH_IRQ);
 
-lv_display_t* g_display = nullptr;
-lv_indev_t* g_indev = nullptr;
+BLEScan* pScan = nullptr;
+BLEAdvertisedDevice* foundDevice = nullptr;
+BLEClient* pClient = nullptr;
+BLERemoteCharacteristic* pHRChar = nullptr;
 
-constexpr uint32_t kUiUpdateMs = 200;
-uint32_t g_next_ui_update = 0;
+bool doConnect = false;
+bool connected = false;
 
-BleHrClient g_hr;
+volatile uint16_t g_hr = 0;
+volatile int g_batt = -1;
+volatile bool g_newHR = false;
 
-lv_color_t g_buf1[TFT_HOR_RES * 20];
-lv_color_t g_buf2[TFT_HOR_RES * 20];
+uint32_t lastScanStartMs = 0;
+uint32_t lastUiMs = 0;
+uint32_t lastBattReadMs = 0;
 
-void myFlushCb(lv_display_t* disp, const lv_area_t* area, uint8_t* px_map) {
-  uint32_t w = static_cast<uint32_t>(area->x2 - area->x1 + 1);
-  uint32_t h = static_cast<uint32_t>(area->y2 - area->y1 + 1);
-  tft.startWrite();
-  tft.setAddrWindow(area->x1, area->y1, w, h);
-  tft.pushPixels(reinterpret_cast<const void*>(px_map), w * h);
-  tft.endWrite();
-  lv_display_flush_ready(disp);
+static uint16_t parseHeartRate(const uint8_t* data, size_t len) {
+  if (len < 2) return 0;
+  uint8_t flags = data[0];
+  bool hr16 = (flags & 0x01) != 0;
+  if (!hr16) return data[1];
+  if (len < 3) return 0;
+  return (uint16_t)data[1] | ((uint16_t)data[2] << 8);
 }
 
-void myTouchRead(lv_indev_t* indev, lv_indev_data_t* data) {
-  (void)indev;
-  if (!touch.touched()) {
-    data->state = LV_INDEV_STATE_RELEASED;
-    return;
+static void hrNotifyCallback(BLERemoteCharacteristic*, uint8_t* pData, size_t length, bool) {
+  uint16_t hr = parseHeartRate(pData, length);
+  if (hr) {
+    g_hr = hr;
+    g_newHR = true;
+  }
+}
+
+class MyClientCallbacks : public BLEClientCallbacks {
+  void onConnect(BLEClient*) override { connected = true; }
+
+  void onDisconnect(BLEClient*) override {
+    connected = false;
+    g_batt = -1;
+    pHRChar = nullptr;
+  }
+};
+
+class MyAdvertisedDeviceCallbacks : public BLEAdvertisedDeviceCallbacks {
+  void onResult(BLEAdvertisedDevice adv) override {
+    String mac = adv.getAddress().toString().c_str();
+    if (!mac.equalsIgnoreCase(TARGET_MAC)) return;
+
+    if (foundDevice) {
+      delete foundDevice;
+      foundDevice = nullptr;
+    }
+    foundDevice = new BLEAdvertisedDevice(adv);
+
+    doConnect = true;
+    pScan->stop();
+  }
+};
+
+static void uiHeader() {
+  tft.fillScreen(TFT_BLACK);
+  tft.setTextDatum(TL_DATUM);
+
+  tft.setTextSize(2);
+  tft.setTextColor(TFT_CYAN, TFT_BLACK);
+  tft.drawString("CYD HRM", 10, 8);
+
+  tft.setTextSize(1);
+  tft.setTextColor(TFT_LIGHTGREY, TFT_BLACK);
+  tft.drawString(String("Name: ") + TARGET_NAME, 10, 34);
+  tft.drawString(String("MAC:  ") + TARGET_MAC, 10, 48);
+
+  tft.drawFastHLine(0, 68, tft.width(), TFT_DARKGREY);
+}
+
+static void uiStatus(const String& s) {
+  tft.fillRect(0, 72, tft.width(), 22, TFT_BLACK);
+  tft.setTextDatum(TL_DATUM);
+  tft.setTextSize(2);
+  tft.setTextColor(TFT_YELLOW, TFT_BLACK);
+  tft.drawString(s, 10, 74);
+}
+
+static void uiValues(uint16_t hr, int batt) {
+  tft.fillRect(0, 100, tft.width(), 80, TFT_BLACK);
+  tft.setTextDatum(TL_DATUM);
+
+  tft.setTextColor(TFT_WHITE, TFT_BLACK);
+  tft.setTextSize(2);
+  tft.drawString("HR", 10, 105);
+
+  tft.setTextSize(6);
+  tft.drawString(String(hr), 10, 132);
+
+  tft.setTextSize(2);
+  tft.drawString("bpm", 190, 152);
+
+  tft.fillRect(0, 190, tft.width(), 30, TFT_BLACK);
+  tft.setTextSize(2);
+  tft.setTextColor(TFT_GREEN, TFT_BLACK);
+  if (batt >= 0) {
+    tft.drawString(String("Battery: ") + batt + "%", 10, 195);
+  } else {
+    tft.drawString("Battery: --", 10, 195);
+  }
+}
+
+static void startScan() {
+  doConnect = false;
+  pScan->clearResults();
+  pScan->start(5, false);
+  lastScanStartMs = millis();
+}
+
+static void readBatteryOnce() {
+  if (!pClient || !connected) return;
+
+  BLERemoteService* batSvc = pClient->getService(BAT_SERVICE);
+  if (!batSvc) return;
+
+  BLERemoteCharacteristic* bat = batSvc->getCharacteristic(BAT_LEVEL_CHAR);
+  if (!bat || !bat->canRead()) return;
+
+  String v = bat->readValue();
+  if (v.length() >= 1) g_batt = (uint8_t)v[0];
+}
+
+static bool connectAndSubscribe() {
+  if (!foundDevice) return false;
+
+  if (pClient) {
+    if (pClient->isConnected()) {
+      pClient->disconnect();
+    }
+    delete pClient;
+    pClient = nullptr;
   }
 
-  TS_Point p = touch.getPoint();
-  // Basic mapping for rotation=1 (320x240). Fine-tune if needed.
-  int16_t x = map(p.x, 200, 3850, 0, TFT_HOR_RES - 1);
-  int16_t y = map(p.y, 240, 3850, 0, TFT_VER_RES - 1);
-  if (x < 0) x = 0;
-  if (x >= TFT_HOR_RES) x = TFT_HOR_RES - 1;
-  if (y < 0) y = 0;
-  if (y >= TFT_VER_RES) y = TFT_VER_RES - 1;
+  pClient = BLEDevice::createClient();
+  pClient->setClientCallbacks(new MyClientCallbacks());
 
-  data->state = LV_INDEV_STATE_PRESSED;
-  data->point.x = x;
-  data->point.y = y;
+  if (!pClient->connect(foundDevice)) return false;
+
+  BLERemoteService* hrSvc = pClient->getService(HR_SERVICE);
+  if (!hrSvc) {
+    pClient->disconnect();
+    return false;
+  }
+
+  pHRChar = hrSvc->getCharacteristic(HR_MEAS_CHAR);
+  if (!pHRChar || !pHRChar->canNotify()) {
+    pClient->disconnect();
+    return false;
+  }
+
+  pHRChar->registerForNotify(hrNotifyCallback);
+
+  delay(50);
+  readBatteryOnce();
+  lastBattReadMs = millis();
+
+  return true;
 }
-
-}  // namespace
 
 void setup() {
   Serial.begin(115200);
-  delay(100);
-  Serial.println("\n[CYD-HRM] Boot");
+  delay(50);
 
-  tft.begin();
-  tft.setRotation(1);
-  tft.fillScreen(TFT_BLACK);
+  tft.init();
+  tft.setRotation(1);  // ggf. 0/2/3 je nach Layout
+  uiHeader();
+  uiStatus("Init...");
 
-  touch_spi.begin(TOUCH_SCK, TOUCH_MISO, TOUCH_MOSI, TOUCH_CS);
-  touch.begin(touch_spi);
-  touch.setRotation(1);
+  BLEDevice::init("CYD_HRM");
+  pScan = BLEDevice::getScan();
+  pScan->setAdvertisedDeviceCallbacks(new MyAdvertisedDeviceCallbacks());
+  pScan->setActiveScan(false);
+  pScan->setInterval(600);
+  pScan->setWindow(60);
 
-  lv_init();
-  g_display = lv_display_create(TFT_HOR_RES, TFT_VER_RES);
-  lv_display_set_flush_cb(g_display, myFlushCb);
-  lv_display_set_buffers(g_display, g_buf1, g_buf2, sizeof(g_buf1), LV_DISPLAY_RENDER_MODE_PARTIAL);
-
-  g_indev = lv_indev_create();
-  lv_indev_set_type(g_indev, LV_INDEV_TYPE_POINTER);
-  lv_indev_set_read_cb(g_indev, myTouchRead);
-
-  g_hr.begin();
-  ui_hr::init(&g_hr);
-
-  g_next_ui_update = millis();
+  uiStatus("Scanning...");
+  startScan();
 }
 
 void loop() {
-  const uint32_t now = millis();
-
-  g_hr.loop();
-
-  if (now >= g_next_ui_update) {
-    g_next_ui_update = now + kUiUpdateMs;
-    ui_hr::refresh(g_hr.snapshot(), now);
+  if (doConnect && !connected) {
+    doConnect = false;
+    uiStatus("Connecting...");
+    if (connectAndSubscribe()) {
+      uiStatus("Connected");
+      uiValues(g_hr, g_batt);
+    } else {
+      uiStatus("Connect failed");
+      delay(800);
+      uiStatus("Scanning...");
+      startScan();
+    }
   }
 
-  lv_timer_handler();
-  delay(5);
+  if (!connected) {
+    if (millis() - lastScanStartMs > 8000) {
+      uiStatus("Scanning...");
+      startScan();
+    }
+  }
+
+  if (connected && (millis() - lastBattReadMs > 60000)) {
+    readBatteryOnce();
+    lastBattReadMs = millis();
+  }
+
+  if (millis() - lastUiMs > 250 || g_newHR) {
+    lastUiMs = millis();
+    bool upd = g_newHR;
+    g_newHR = false;
+    if (connected && upd) uiValues(g_hr, g_batt);
+  }
+
+  delay(10);
 }
