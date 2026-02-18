@@ -98,6 +98,35 @@ struct HasAdvertisingService<
     T, std::void_t<decltype(std::declval<const T&>().isAdvertisingService(
            NimBLEUUID((uint16_t)kHrServiceUuid16)))>> : std::true_type {};
 
+template <typename T, typename = void>
+struct HasGetResults : std::false_type {};
+
+template <typename T>
+struct HasGetResults<T, std::void_t<decltype(std::declval<T&>().getResults())>>
+    : std::true_type {};
+
+template <typename T, typename = void>
+struct HasClearResults : std::false_type {};
+
+template <typename T>
+struct HasClearResults<T, std::void_t<decltype(std::declval<T&>().clearResults())>>
+    : std::true_type {};
+
+template <typename T, typename = void>
+struct HasResultsGetCount : std::false_type {};
+
+template <typename T>
+struct HasResultsGetCount<T, std::void_t<decltype(std::declval<T&>().getCount())>>
+    : std::true_type {};
+
+template <typename T, typename = void>
+struct HasResultsGetDevice : std::false_type {};
+
+template <typename T>
+struct HasResultsGetDevice<T,
+                           std::void_t<decltype(std::declval<T&>().getDevice(size_t{}))>>
+    : std::true_type {};
+
 int getBtStartedStatus() {
 #if ALL_HAS_ESP_BT_H
   return btStarted() ? 1 : 0;
@@ -141,6 +170,7 @@ NimBLEClient* g_client = nullptr;
 NimBLERemoteCharacteristic* g_hr_char = nullptr;
 bool g_notify_received = false;
 uint32_t g_notify_started_ms = 0;
+bool g_warned_missing_results_api = false;
 
 const char* stateName(State s) {
   switch (s) {
@@ -257,7 +287,7 @@ void onAdvertisedDevice(const NimBLEAdvertisedDevice* dev) {
 
 class ScanCallbacksNew : public NimBLEScanCallbacks {
  public:
-  void onResult(const NimBLEAdvertisedDevice* dev) override { onAdvertisedDevice(dev); }
+  void onResult(const NimBLEAdvertisedDevice*) override {}
 
   void onScanEnd(const NimBLEScanResults&, int reason) override {
     g_scan_running = false;
@@ -268,7 +298,7 @@ class ScanCallbacksNew : public NimBLEScanCallbacks {
 
 class ScanCallbacksLegacy : public NimBLEAdvertisedDeviceCallbacks {
  public:
-  void onResult(NimBLEAdvertisedDevice* dev) override { onAdvertisedDevice(dev); }
+  void onResult(NimBLEAdvertisedDevice*) override {}
 };
 
 ScanCallbacksNew g_scan_callbacks_new;
@@ -282,7 +312,44 @@ void setScanCallbacksCompat(NimBLEScan* scan) {
     scan->setAdvertisedDeviceCallbacks(&g_scan_callbacks_legacy, true);
     Serial.println("[ALL][S2] api=advertised_device_callbacks");
   } else {
-#error "Unsupported NimBLE-Arduino API: neither setScanCallbacks nor setAdvertisedDeviceCallbacks is available"
+    Serial.println("[ALL][S2] api=no_scan_callbacks");
+  }
+}
+
+template <typename T>
+void processResultDevice(T&& dev_entry) {
+  using Entry = std::remove_reference_t<T>;
+  if constexpr (std::is_pointer<Entry>::value) {
+    onAdvertisedDevice(dev_entry);
+  } else {
+    onAdvertisedDevice(&dev_entry);
+  }
+}
+
+void evaluateScanResultsCompat(NimBLEScan* scan) {
+  if constexpr (HasGetResults<NimBLEScan>::value) {
+    auto results = scan->getResults();
+    using Results = std::decay_t<decltype(results)>;
+    if constexpr (HasResultsGetCount<Results>::value && HasResultsGetDevice<Results>::value) {
+      const size_t count = static_cast<size_t>(results.getCount());
+      for (size_t i = 0; i < count; ++i) {
+        auto dev_entry = results.getDevice(i);
+        processResultDevice(dev_entry);
+      }
+    } else {
+      Serial.println("[ALL][S2] WARN: getResults() found but result iteration API is incomplete");
+    }
+
+    if constexpr (HasClearResults<NimBLEScan>::value) {
+      scan->clearResults();
+    }
+  } else {
+    if (!g_warned_missing_results_api) {
+      Serial.println(
+          "[ALL][S2] WARN: getResults() not available in this NimBLE API; cannot list devices, "
+          "only start/stop status.");
+      g_warned_missing_results_api = true;
+    }
   }
 }
 
@@ -388,7 +455,9 @@ bool startScanRound() {
   scan->setActiveScan(cfg.active);
   scan->setDuplicateFilter(cfg.dup);
   scan->setMaxResults(0);
-  scan->clearResults();
+  if constexpr (HasClearResults<NimBLEScan>::value) {
+    scan->clearResults();
+  }
 
   g_scan_running = true;
   g_scan_end_seen = false;
@@ -400,7 +469,17 @@ bool startScanRound() {
 
   const bool started = scan->start(kRoundDurationSeconds, false, true);
   Serial.printf("[ALL][S2] start()=%d\n", started ? 1 : 0);
-  return started;
+  if (!started) {
+    g_scan_running = false;
+    return false;
+  }
+
+  g_scan_running = false;
+  g_scan_end_seen = true;
+  g_scan_end_reason = 0;
+  Serial.println("[ALL][S2] scan ended");
+  evaluateScanResultsCompat(scan);
+  return true;
 }
 
 void hardFailStartFalse() {
@@ -422,6 +501,9 @@ void printRoundSummary() {
 
   if (!g_scan_end_seen) {
     Serial.println("[ALL][S2] note: no onScanEnd callback observed");
+  }
+  if (!HasGetResults<NimBLEScan>::value) {
+    Serial.println("[ALL][S2] note: summary is callback/start-stop only (result list unavailable)");
   }
   if (g_stats.unique_full) {
     Serial.printf("[ALL][S2] note: unique MAC capacity reached (%u)\n",
