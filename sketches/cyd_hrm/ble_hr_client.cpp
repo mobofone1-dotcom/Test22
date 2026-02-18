@@ -1,15 +1,5 @@
 #include "ble_hr_client.h"
 
-#ifndef HR_DUMMY_MODE
-#if __has_include(<NimBLEDevice.h>)
-#include <NimBLEDevice.h>
-#define HRM_USE_NIMBLE 1
-#elif __has_include(<BLEDevice.h>)
-#include <BLEDevice.h>
-#define HRM_USE_CLASSIC_BLE 1
-#endif
-#endif
-
 #if defined(ESP32)
 #include "freertos/FreeRTOS.h"
 #include "freertos/portmacro.h"
@@ -378,4 +368,3 @@ HrSnapshot BleHrClient::snapshot() const {
   HRM_UNLOCK();
   return snap;
 }
-
