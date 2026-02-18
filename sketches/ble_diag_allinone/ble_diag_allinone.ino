@@ -3,6 +3,8 @@
 #include <algorithm>
 #include <type_traits>
 
+#define ENABLE_CONNECT_TEST 0
+
 #if __has_include("esp_bt.h")
 #include "esp_bt.h"
 #define ALL_HAS_ESP_BT_H 1
@@ -73,22 +75,6 @@ struct ScanStats {
   String best_mac;
   String best_name;
 };
-
-template <typename T, typename = void>
-struct HasSetScanCallbacks : std::false_type {};
-
-template <typename T>
-struct HasSetScanCallbacks<
-    T, std::void_t<decltype(std::declval<T&>().setScanCallbacks(nullptr, true))>>
-    : std::true_type {};
-
-template <typename T, typename = void>
-struct HasSetAdvertisedCallbacks : std::false_type {};
-
-template <typename T>
-struct HasSetAdvertisedCallbacks<
-    T, std::void_t<decltype(std::declval<T&>().setAdvertisedDeviceCallbacks(nullptr, true))>>
-    : std::true_type {};
 
 template <typename T, typename = void>
 struct HasAdvertisingService : std::false_type {};
@@ -166,11 +152,15 @@ Candidate g_target_by_name;
 Candidate g_target_by_service;
 Candidate g_best_candidate;
 bool g_start_retry_done = false;
+#if ENABLE_CONNECT_TEST
 NimBLEClient* g_client = nullptr;
 NimBLERemoteCharacteristic* g_hr_char = nullptr;
 bool g_notify_received = false;
 uint32_t g_notify_started_ms = 0;
+#endif
 bool g_warned_missing_results_api = false;
+bool g_results_iteration_available = true;
+bool g_stop_sketch = false;
 
 const char* stateName(State s) {
   switch (s) {
@@ -285,44 +275,104 @@ void onAdvertisedDevice(const NimBLEAdvertisedDevice* dev) {
                 name.c_str());
 }
 
-class ScanCallbacksNew : public NimBLEScanCallbacks {
- public:
-  void onResult(const NimBLEAdvertisedDevice*) override {}
+// Callback APIs are intentionally unused in this sketch.
 
-  void onScanEnd(const NimBLEScanResults&, int reason) override {
-    g_scan_running = false;
-    g_scan_end_seen = true;
-    g_scan_end_reason = reason;
-  }
-};
+template <typename T, typename = void>
+struct HasSetDuplicateFilter : std::false_type {};
 
-class ScanCallbacksLegacy : public NimBLEAdvertisedDeviceCallbacks {
- public:
-  void onResult(NimBLEAdvertisedDevice*) override {}
-};
+template <typename T>
+struct HasSetDuplicateFilter<T,
+                             std::void_t<decltype(std::declval<T&>().setDuplicateFilter(true))>>
+    : std::true_type {};
 
-ScanCallbacksNew g_scan_callbacks_new;
-ScanCallbacksLegacy g_scan_callbacks_legacy;
+template <typename T, typename = void>
+struct HasSetMaxResults : std::false_type {};
 
-void setScanCallbacksCompat(NimBLEScan* scan) {
-  if constexpr (HasSetScanCallbacks<NimBLEScan>::value) {
-    scan->setScanCallbacks(&g_scan_callbacks_new, true);
-    Serial.println("[ALL][S2] api=scan_callbacks");
-  } else if constexpr (HasSetAdvertisedCallbacks<NimBLEScan>::value) {
-    scan->setAdvertisedDeviceCallbacks(&g_scan_callbacks_legacy, true);
-    Serial.println("[ALL][S2] api=advertised_device_callbacks");
-  } else {
-    Serial.println("[ALL][S2] api=no_scan_callbacks");
-  }
+template <typename T>
+struct HasSetMaxResults<T, std::void_t<decltype(std::declval<T&>().setMaxResults(0))>>
+    : std::true_type {};
+
+template <typename T, typename = void>
+struct HasStart3 : std::false_type {};
+
+template <typename T>
+struct HasStart3<T,
+                 std::void_t<decltype(std::declval<T&>().start(uint32_t{}, false, true))>>
+    : std::true_type {};
+
+template <typename T, typename = void>
+struct HasStart2 : std::false_type {};
+
+template <typename T>
+struct HasStart2<T, std::void_t<decltype(std::declval<T&>().start(uint32_t{}, false))>>
+    : std::true_type {};
+
+template <typename T, typename = void>
+struct HasStop : std::false_type {};
+
+template <typename T>
+struct HasStop<T, std::void_t<decltype(std::declval<T&>().stop())>> : std::true_type {};
+
+template <typename T, typename = void>
+struct HasResultGetAddress : std::false_type {};
+
+template <typename T>
+struct HasResultGetAddress<T, std::void_t<decltype(std::declval<const T&>().getAddress())>>
+    : std::true_type {};
+
+template <typename T, typename = void>
+struct HasResultGetRssi : std::false_type {};
+
+template <typename T>
+struct HasResultGetRssi<T, std::void_t<decltype(std::declval<const T&>().getRSSI())>>
+    : std::true_type {};
+
+template <typename T, typename = void>
+struct HasResultHaveName : std::false_type {};
+
+template <typename T>
+struct HasResultHaveName<T, std::void_t<decltype(std::declval<const T&>().haveName())>>
+    : std::true_type {};
+
+template <typename T, typename = void>
+struct HasResultGetName : std::false_type {};
+
+template <typename T>
+struct HasResultGetName<T, std::void_t<decltype(std::declval<const T&>().getName())>>
+    : std::true_type {};
+
+template <typename T, typename = void>
+struct HasResultCtor : std::false_type {};
+
+template <typename T>
+struct HasResultCtor<T, std::void_t<decltype(NimBLEAdvertisedDevice(std::declval<T>()))>>
+    : std::true_type {};
+
+void haltSketch(const char* reason) {
+  Serial.printf("[ALL][STOP] %s\n", reason);
+  g_stop_sketch = true;
 }
 
 template <typename T>
-void processResultDevice(T&& dev_entry) {
-  using Entry = std::remove_reference_t<T>;
-  if constexpr (std::is_pointer<Entry>::value) {
+void processResultDevice(const T& dev_entry) {
+  if constexpr (std::is_pointer<T>::value) {
     onAdvertisedDevice(dev_entry);
-  } else {
+  } else if constexpr (std::is_same_v<std::decay_t<T>, NimBLEAdvertisedDevice>) {
     onAdvertisedDevice(&dev_entry);
+  } else if constexpr (HasResultCtor<T>::value) {
+    NimBLEAdvertisedDevice converted(dev_entry);
+    onAdvertisedDevice(&converted);
+  } else if constexpr (HasResultGetAddress<T>::value && HasResultGetRssi<T>::value) {
+    const String mac = String(dev_entry.getAddress().toString().c_str());
+    const int rssi = dev_entry.getRSSI();
+    String name;
+    if constexpr (HasResultHaveName<T>::value && HasResultGetName<T>::value) {
+      if (dev_entry.haveName()) {
+        name = String(dev_entry.getName().c_str());
+      }
+    }
+    Serial.printf("[ALL][S2] dev mac=%s rssi=%d name=\"%s\"\n", mac.c_str(), rssi,
+                  name.c_str());
   }
 }
 
@@ -337,7 +387,8 @@ void evaluateScanResultsCompat(NimBLEScan* scan) {
         processResultDevice(dev_entry);
       }
     } else {
-      Serial.println("[ALL][S2] WARN: getResults() found but result iteration API is incomplete");
+      Serial.println("[ALL][S2] WARN: NimBLE API has no results iteration; cannot list devices");
+      g_results_iteration_available = false;
     }
 
     if constexpr (HasClearResults<NimBLEScan>::value) {
@@ -345,12 +396,30 @@ void evaluateScanResultsCompat(NimBLEScan* scan) {
     }
   } else {
     if (!g_warned_missing_results_api) {
-      Serial.println(
-          "[ALL][S2] WARN: getResults() not available in this NimBLE API; cannot list devices, "
-          "only start/stop status.");
+      Serial.println("[ALL][S2] WARN: NimBLE API has no results iteration; cannot list devices");
       g_warned_missing_results_api = true;
     }
+    g_results_iteration_available = false;
   }
+}
+
+bool startScanCompat(NimBLEScan* scan) {
+  if constexpr (HasStart3<NimBLEScan>::value) {
+    const auto rc = scan->start(kRoundDurationSeconds, false, true);
+    if constexpr (std::is_same_v<decltype(rc), bool>) {
+      return rc;
+    }
+    return true;
+  } else if constexpr (HasStart2<NimBLEScan>::value) {
+    const auto rc = scan->start(kRoundDurationSeconds, false);
+    if constexpr (std::is_same_v<decltype(rc), bool>) {
+      return rc;
+    }
+    return true;
+  }
+
+  Serial.println("[ALL][S2] WARN: NimBLEScan::start signature unknown in this API");
+  return false;
 }
 
 void logBuildConfig(const char* name, bool enabled) {
@@ -449,12 +518,16 @@ bool startScanRound() {
 
   const RoundCfg& cfg = kRoundPlan[g_round_index % (sizeof(kRoundPlan) / sizeof(kRoundPlan[0]))];
 
-  setScanCallbacksCompat(scan);
+  Serial.println("[ALL][S2] callback-free scan mode");
   scan->setInterval(cfg.interval);
   scan->setWindow(cfg.window);
   scan->setActiveScan(cfg.active);
-  scan->setDuplicateFilter(cfg.dup);
-  scan->setMaxResults(0);
+  if constexpr (HasSetDuplicateFilter<NimBLEScan>::value) {
+    scan->setDuplicateFilter(cfg.dup);
+  }
+  if constexpr (HasSetMaxResults<NimBLEScan>::value) {
+    scan->setMaxResults(0);
+  }
   if constexpr (HasClearResults<NimBLEScan>::value) {
     scan->clearResults();
   }
@@ -467,7 +540,7 @@ bool startScanRound() {
       static_cast<unsigned long>(g_round_counter + 1), static_cast<unsigned int>(cfg.interval),
       static_cast<unsigned int>(cfg.window), cfg.active ? 1 : 0, cfg.dup ? 1 : 0);
 
-  const bool started = scan->start(kRoundDurationSeconds, false, true);
+  const bool started = startScanCompat(scan);
   Serial.printf("[ALL][S2] start()=%d\n", started ? 1 : 0);
   if (!started) {
     g_scan_running = false;
@@ -503,7 +576,7 @@ void printRoundSummary() {
     Serial.println("[ALL][S2] note: no onScanEnd callback observed");
   }
   if (!HasGetResults<NimBLEScan>::value) {
-    Serial.println("[ALL][S2] note: summary is callback/start-stop only (result list unavailable)");
+      Serial.println("[ALL][S2] note: summary is callback-free/start-only (result list unavailable)");
   }
   if (g_stats.unique_full) {
     Serial.printf("[ALL][S2] note: unique MAC capacity reached (%u)\n",
@@ -511,6 +584,7 @@ void printRoundSummary() {
   }
 }
 
+#if ENABLE_CONNECT_TEST
 void hrNotifyCb(NimBLERemoteCharacteristic*, uint8_t* data, size_t len, bool) {
   if (data == nullptr || len < 2) {
     return;
@@ -553,7 +627,8 @@ void doConnectAndSubscribe() {
 
   const uint32_t backoff[] = {1000, 2000, 4000};
   bool connected = false;
-  NimBLEAddress addr(g_best_candidate.mac.c_str());
+  NimBLEAddress addr(std::string(g_best_candidate.mac.c_str()), BLE_ADDR_PUBLIC);
+  Serial.println("[ALL][S4] address type assumption: BLE_ADDR_PUBLIC");
 
   for (size_t i = 0; i < 3; ++i) {
     Serial.printf("[ALL][S4] connect try=%u/%u mac=%s\n", static_cast<unsigned int>(i + 1), 3,
@@ -600,6 +675,7 @@ void doConnectAndSubscribe() {
   g_notify_started_ms = millis();
   transition(S5_WAIT_NOTIFY);
 }
+#endif
 
 void setup() {
   Serial.begin(115200);
@@ -655,7 +731,9 @@ void loop() {
 
       if (g_scan_running && (millis() - g_state_started_ms) > (kRoundDurationSeconds + 2) * 1000UL) {
         g_scan_running = false;
-        NimBLEDevice::getScan()->stop();
+        if constexpr (HasStop<NimBLEScan>::value) {
+          NimBLEDevice::getScan()->stop();
+        }
         Serial.println("[ALL][S2] timeout waiting for scan end");
       }
 
@@ -665,6 +743,10 @@ void loop() {
           Serial.printf("[ALL][S2] t=%lus\n", static_cast<unsigned long>(g_last_heartbeat_s));
         }
         printRoundSummary();
+        if (!g_results_iteration_available) {
+          haltSketch("[ALL][S2] WARN: NimBLE API has no results iteration; cannot list devices");
+          break;
+        }
         transition(S3_FILTER_TARGET);
       }
       break;
@@ -692,18 +774,31 @@ void loop() {
         g_round_index = g_round_counter % (sizeof(kRoundPlan) / sizeof(kRoundPlan[0]));
         transition(S2_SCAN_ROUND);
       } else {
+#if ENABLE_CONNECT_TEST
         transition(S4_CONNECT_HRM);
+#else
+        Serial.println("[ALL][S3] connect test disabled (ENABLE_CONNECT_TEST=0)");
+        g_round_counter++;
+        g_round_index = g_round_counter % (sizeof(kRoundPlan) / sizeof(kRoundPlan[0]));
+        transition(S2_SCAN_ROUND);
+#endif
       }
       break;
     }
 
     case S4_CONNECT_HRM:
       g_state_entry = false;
+#if ENABLE_CONNECT_TEST
       doConnectAndSubscribe();
+#else
+      Serial.println("[ALL][S4] connect test disabled");
+      transition(S2_SCAN_ROUND);
+#endif
       break;
 
     case S5_WAIT_NOTIFY:
       g_state_entry = false;
+#if ENABLE_CONNECT_TEST
       if (g_notify_received) {
         Serial.println("[ALL][S5] notify received");
         if (g_client != nullptr && g_client->isConnected()) {
@@ -721,6 +816,9 @@ void loop() {
         g_round_index = g_round_counter % (sizeof(kRoundPlan) / sizeof(kRoundPlan[0]));
         transition(S2_SCAN_ROUND);
       }
+#else
+      transition(S2_SCAN_ROUND);
+#endif
       break;
 
     case S_ERR_HARDFAIL:
@@ -731,6 +829,12 @@ void loop() {
       g_round_index = 0;
       transition(S0_BOOT_INFO);
       break;
+  }
+
+  if (g_stop_sketch) {
+    while (true) {
+      delay(1000);
+    }
   }
 
   delay(kStateTickMs);
