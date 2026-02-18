@@ -71,26 +71,48 @@ void setup() {
   logErr("[BT1] mem_release(CLASSIC)", esp_bt_controller_mem_release(ESP_BT_MODE_CLASSIC_BT));
 
   esp_bt_controller_config_t bt_cfg = BT_CONTROLLER_INIT_CONFIG_DEFAULT();
-  logErr("[BT1] controller_init", esp_bt_controller_init(&bt_cfg));
-  logErr("[BT1] controller_enable(BLE)", esp_bt_controller_enable(ESP_BT_MODE_BLE));
+  esp_err_t initRc = esp_bt_controller_init(&bt_cfg);
+  logErr("[BT1] controller_init", initRc);
+  esp_err_t enableRc = esp_bt_controller_enable(ESP_BT_MODE_BLE);
+  logErr("[BT1] controller_enable(BLE)", enableRc);
+
+  if (initRc == ESP_ERR_INVALID_STATE || enableRc == ESP_ERR_INVALID_STATE) {
+    Serial.println("[BT1] INVALID_STATE detected -> running controller reset sequence");
+    logErr("[BT1] controller_disable(pre)", esp_bt_controller_disable());
+    logErr("[BT1] controller_deinit(pre)", esp_bt_controller_deinit());
+    logStatus("[BT1] status(after pre-reset)");
+
+    initRc = esp_bt_controller_init(&bt_cfg);
+    logErr("[BT1] controller_init(retry)", initRc);
+    enableRc = esp_bt_controller_enable(ESP_BT_MODE_BLE);
+    logErr("[BT1] controller_enable(BLE)(retry)", enableRc);
+    logStatus("[BT1] status(after retry)");
+
+    bool retryEnabled = btStarted() || (esp_bt_controller_get_status() == ESP_BT_CONTROLLER_STATUS_ENABLED);
+    if (!retryEnabled) {
+      Serial.println("[BT1] retry still not enabled -> running bluedroid + controller reset");
+      logErr("[BT1] bluedroid_disable", esp_bluedroid_disable());
+      logErr("[BT1] bluedroid_deinit", esp_bluedroid_deinit());
+      logErr("[BT1] controller_disable(second)", esp_bt_controller_disable());
+      logErr("[BT1] controller_deinit(second)", esp_bt_controller_deinit());
+      logErr("[BT1] controller_init(second)", esp_bt_controller_init(&bt_cfg));
+      logErr("[BT1] controller_enable(BLE)(second)", esp_bt_controller_enable(ESP_BT_MODE_BLE));
+      logStatus("[BT1] status(after second reset)");
+    }
+  }
 
   logStatus("[BT1] status(after)");
 
-  bool enabled = false;
-#ifdef ESP_BT_CONTROLLER_STATUS_ENABLED
-  enabled = (esp_bt_controller_get_status() == ESP_BT_CONTROLLER_STATUS_ENABLED);
-#else
-  enabled = btStarted();
-#endif
+  bool enabled = btStarted() || (esp_bt_controller_get_status() == ESP_BT_CONTROLLER_STATUS_ENABLED);
 
   if (!enabled) {
-    Serial.println("[BT1] HARD FAIL: controller not enabled. Stop.");
+    Serial.println("[BT1] HARD FAIL persists (invalid state). Likely core/BT init conflict.");
     while (true) {
       delay(1000);
     }
   }
 
-  Serial.println("[BT1] SUCCESS: controller enabled.");
+  Serial.println("[BT1] SUCCESS after reset sequence");
   while (true) {
     delay(1000);
   }
