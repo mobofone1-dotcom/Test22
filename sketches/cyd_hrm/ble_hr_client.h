@@ -2,6 +2,18 @@
 
 #include <Arduino.h>
 
+#ifndef HR_DUMMY_MODE
+#if defined(__has_include)
+#if __has_include(<NimBLEDevice.h>)
+#include <NimBLEDevice.h>
+#define HRM_USE_NIMBLE 1
+#elif __has_include(<BLEDevice.h>)
+#include <BLEDevice.h>
+#define HRM_USE_CLASSIC_BLE 1
+#endif
+#endif
+#endif
+
 enum class HrConnState : uint8_t {
   DISCONNECTED = 0,
   SCANNING,
@@ -52,4 +64,3 @@ class BleHrClient {
   int8_t dummy_step_ = 2;
 #endif
 };
-
