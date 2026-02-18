@@ -39,7 +39,7 @@ void myFlushCb(lv_display_t* disp, const lv_area_t* area, uint8_t* px_map) {
   uint32_t h = static_cast<uint32_t>(area->y2 - area->y1 + 1);
   tft.startWrite();
   tft.setAddrWindow(area->x1, area->y1, w, h);
-  tft.pushPixels(reinterpret_cast<uint16_t*>(px_map), w * h, true);
+  tft.pushPixels(reinterpret_cast<const void*>(px_map), w * h);
   tft.endWrite();
   lv_display_flush_ready(disp);
 }
@@ -108,4 +108,3 @@ void loop() {
   lv_timer_handler();
   delay(5);
 }
-

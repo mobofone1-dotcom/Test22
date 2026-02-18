@@ -43,12 +43,12 @@ void init(BleHrClient* client) {
   lv_obj_set_style_text_color(scr, lv_color_white(), 0);
 
   g_bpm_label = lv_label_create(scr);
-  lv_obj_set_style_text_font(g_bpm_label, &lv_font_montserrat_48, 0);
+  lv_obj_set_style_text_font(g_bpm_label, &lv_font_montserrat_14, 0);
   lv_label_set_text(g_bpm_label, "--");
   lv_obj_align(g_bpm_label, LV_ALIGN_CENTER, 0, -42);
 
   g_minmax_label = lv_label_create(scr);
-  lv_obj_set_style_text_font(g_minmax_label, &lv_font_montserrat_16, 0);
+  lv_obj_set_style_text_font(g_minmax_label, &lv_font_montserrat_14, 0);
   lv_label_set_text(g_minmax_label, "MIN --   MAX --");
   lv_obj_align(g_minmax_label, LV_ALIGN_CENTER, 0, 18);
 
@@ -88,4 +88,3 @@ void refresh(const HrSnapshot& snap, uint32_t now_ms) {
 }
 
 }  // namespace ui_hr
-
