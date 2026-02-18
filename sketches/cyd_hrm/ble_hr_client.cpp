@@ -19,7 +19,6 @@ constexpr uint32_t kScanPauseMs = 1000;
 
 BleHrClient* g_instance = nullptr;
 
-#if defined(HRM_USE_NIMBLE)
 NimBLEClient* g_client = nullptr;
 NimBLEAdvertisedDevice* g_target = nullptr;
 bool g_scan_running = false;
@@ -81,42 +80,6 @@ void hrNotifyCb(NimBLERemoteCharacteristic* c, uint8_t* data, size_t len, bool i
   g_instance->onHeartRate(bpm);
 }
 
-#elif defined(HRM_USE_CLASSIC_BLE)
-BLEClient* g_client = nullptr;
-BLEAddress* g_target_address = nullptr;
-bool g_scan_running = false;
-
-class HrScanCallbacks : public BLEAdvertisedDeviceCallbacks {
-  void onResult(BLEAdvertisedDevice advertisedDevice) override {
-    if (!advertisedDevice.haveServiceUUID() ||
-        !advertisedDevice.isAdvertisingService(BLEUUID((uint16_t)kHrServiceUuid16))) {
-      return;
-    }
-    if (g_target_address != nullptr) {
-      delete g_target_address;
-      g_target_address = nullptr;
-    }
-    g_target_address = new BLEAddress(advertisedDevice.getAddress());
-    BLEDevice::getScan()->stop();
-  }
-};
-
-HrScanCallbacks g_scan_callbacks;
-
-void hrNotifyCb(BLERemoteCharacteristic* c, uint8_t* data, size_t len, bool is_notify) {
-  (void)c;
-  (void)is_notify;
-  if (g_instance == nullptr || data == nullptr || len < 2) {
-    return;
-  }
-  const uint8_t flags = data[0];
-  uint16_t bpm = ((flags & 0x01U) == 0U) ? data[1] : (len >= 3 ? (uint16_t)(data[1] | ((uint16_t)data[2] << 8U)) : 0);
-  if (bpm > 0) {
-    g_instance->onHeartRate(bpm);
-  }
-}
-#endif
-
 }  // namespace
 
 void BleHrClient::begin() {
@@ -134,7 +97,6 @@ void BleHrClient::begin() {
   Serial.println("[HRM] HR_DUMMY_MODE active");
   return;
 #else
-#if defined(HRM_USE_NIMBLE)
   NimBLEDevice::init("CYD-HRM");
   NimBLEDevice::setPower(ESP_PWR_LVL_P9);
   NimBLEScan* scan = NimBLEDevice::getScan();
@@ -142,19 +104,7 @@ void BleHrClient::begin() {
   scan->setInterval(80);
   scan->setWindow(48);
   scan->setActiveScan(true);
-  Serial.println("[HRM] NimBLE initialized");
-#elif defined(HRM_USE_CLASSIC_BLE)
-  BLEDevice::init("CYD-HRM");
-  BLEScan* scan = BLEDevice::getScan();
-  scan->setAdvertisedDeviceCallbacks(&g_scan_callbacks);
-  scan->setActiveScan(true);
-  scan->setInterval(80);
-  scan->setWindow(48);
-  Serial.println("[HRM] BLEDevice fallback initialized");
-#else
-  setState(HrConnState::ERROR);
-  Serial.println("[HRM] ERROR: no BLE library found. Install NimBLE-Arduino.");
-#endif
+  Serial.println("[HRM] Using NimBLE");
 #endif
 }
 
@@ -216,7 +166,6 @@ void BleHrClient::loop() {
   }
   return;
 #else
-#if defined(HRM_USE_NIMBLE)
   const uint32_t now = millis();
 
   if (state_ != HrConnState::SUBSCRIBED && g_client != nullptr && !g_client->isConnected()) {
@@ -297,49 +246,6 @@ void BleHrClient::loop() {
   if (state_ == HrConnState::SCANNING && now >= next_scan_ms_) {
     setState(HrConnState::DISCONNECTED);
   }
-#elif defined(HRM_USE_CLASSIC_BLE)
-  const uint32_t now = millis();
-  if (state_ == HrConnState::DISCONNECTED && now >= next_scan_ms_) {
-    setState(HrConnState::SCANNING);
-  }
-  if (state_ == HrConnState::SCANNING && !g_scan_running) {
-    g_scan_running = true;
-    BLEDevice::getScan()->start(kScanDurationMs / 1000, false);
-    g_scan_running = false;
-    next_scan_ms_ = now + kScanPauseMs;
-    if (g_target_address != nullptr) {
-      setState(HrConnState::CONNECTING);
-    } else {
-      setState(HrConnState::DISCONNECTED);
-    }
-  }
-  if (state_ == HrConnState::CONNECTING && now >= next_connect_ms_ && g_target_address != nullptr) {
-    if (g_client == nullptr) {
-      g_client = BLEDevice::createClient();
-    }
-    if (!g_client->connect(*g_target_address)) {
-      setState(HrConnState::DISCONNECTED);
-      next_scan_ms_ = now + backoff_ms_;
-      backoff_ms_ = min<uint32_t>(backoff_ms_ * 2U, 30000U);
-      return;
-    }
-    BLERemoteService* service = g_client->getService(BLEUUID((uint16_t)kHrServiceUuid16));
-    BLERemoteCharacteristic* hr_char = service ? service->getCharacteristic(BLEUUID((uint16_t)kHrMeasurementCharUuid16)) : nullptr;
-    if (hr_char == nullptr || !hr_char->canNotify()) {
-      g_client->disconnect();
-      setState(HrConnState::DISCONNECTED);
-      next_scan_ms_ = now + backoff_ms_;
-      return;
-    }
-    hr_char->registerForNotify(hrNotifyCb);
-    setState(HrConnState::SUBSCRIBED);
-    backoff_ms_ = 1000;
-    delete g_target_address;
-    g_target_address = nullptr;
-  }
-#else
-  // no BLE lib
-#endif
 #endif
 }
 
