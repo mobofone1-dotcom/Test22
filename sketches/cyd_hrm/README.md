@@ -1,25 +1,44 @@
-# CYD HRM Sketch (ESP32 + ILI9341 + klassisches BLE)
+# CYD BLE HRM (Magene H303)
 
-Start-Sketch: `sketches/cyd_hrm/cyd_hrm.ino`
+Sketch: `sketches/cyd_hrm/cyd_hrm.ino`
 
 ## Ziel
-- Verbindung zu Magene H303 Pulsgurt per BLE (ohne NimBLE)
-- Herzfrequenz aus `0x2A37` per Notify anzeigen
-- Batterie (`0x2A19`) optional lesen und anzeigen
+- CYD (ESP32 + ILI9341 + XPT2046) liest einen BLE-Pulsgurt (Magene H303) aus.
+- Anzeige auf dem CYD: HR sehr groß, Min/Max groß, Touch-Button `RESET` setzt Min/Max zurück.
+- Robuste BLE-Umsetzung mit ESP32 BLE Arduino (`BLEDevice`), **ohne NimBLE**.
+
+## Warum der Ansatz so umgesetzt ist
+1. NimBLE wurde bewusst nicht verwendet, weil das Verhalten mit dem klassischen ESP32 BLE Stack stabil war.
+2. In manchen Arduino-ESP32/BLE-Umgebungen liefern APIs wie `readValue()`/`getName()` Arduino `String`.
+   Deshalb wird im Sketch konsequent mit Arduino `String` gearbeitet und nicht mit `std::string`.
+3. Das Finden des Gurts erfolgt über `TARGET_MAC` (Name kann leer/inkonsistent sein).
+4. UI-Bereiche werden nur bei Änderung neu gezeichnet, um Flackern zu vermeiden.
+5. Touch-Mapping ist für CYD kalibriert, inklusive Spiegel-Fix nach Rotation.
+
+## BLE UUIDs
+- Heart Rate Service: `0x180D`
+- Heart Rate Measurement (Notify): `0x2A37`
+- Battery Service: `0x180F`
+- Battery Level (Read): `0x2A19`
+
+## Touch-Konfiguration (CYD Baseline)
+- HSPI: `CS=33`, `SCK=25`, `MISO=39`, `MOSI=32`
+- Calibration:
+  - `TS_SWAP_XY=1`
+  - `TS_INVERT_X=0`
+  - `TS_INVERT_Y=1`
+  - `TS_MINX=171 TS_MAXX=3868 TS_MINY=254 TS_MAXY=3794`
+- `TS_Z_MIN=5`
+- Spiegel-Fix nach Rotation: `sx=w-1-sx`, `sy=h-1-sy`
 
 ## Benötigte Libraries
-- `TFT_eSPI` (mit passendem `User_Setup` für CYD-2432S028 / ILI9341)
-- ESP32 Arduino BLE (`BLEDevice.h`, `BLEScan.h`, `BLEClient.h`, `BLEAdvertisedDevice.h`)
+- `TFT_eSPI` (mit passendem CYD / ILI9341 Setup)
+- `XPT2046_Touchscreen`
+- ESP32 BLE Arduino (`BLEDevice.h`, `BLEScan.h`, `BLEClient.h`, `BLEAdvertisedDevice.h`)
 
-## Wichtige Hinweise
-- Diese Variante nutzt **nicht** NimBLE.
-- In dieser Arduino-ESP32 BLE Umgebung wird z. B. `readValue()` als `String` verarbeitet.
-  Deshalb kein `std::string` im User-Code verwenden.
-- Gerätefilter läuft robust per `TARGET_MAC`.
-- Scan ist passiv (`setActiveScan(false)`) mit konservativen Intervall/Window-Werten.
-
-## Erwartetes Verhalten
-- UI zeigt: `Scanning...` → `Connecting...` → `Connected`
-- BPM wird live aktualisiert
-- Batterie wird bei Connect und danach alle 60 s gelesen (falls verfügbar)
-- Nach Disconnect wird automatisch wieder gescannt und neu verbunden
+## Bedienung
+- Start: `Scanning...` → `Connecting...` → `Connected`
+- HR kommt via Notify und wird groß angezeigt.
+- Min/Max werden ab erstem HR geführt.
+- Touch auf `RESET` setzt Min/Max auf leer (`--`).
+- Batterie wird bei Connect und danach alle 60 s gelesen (falls verfügbar).
