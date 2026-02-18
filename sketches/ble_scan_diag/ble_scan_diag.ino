@@ -1,154 +1,218 @@
 #include <NimBLEDevice.h>
 
-#include <string>
-#include <vector>
+#if __has_include("esp_bt.h")
+#include "esp_bt.h"
+#define HAS_ESP_BT_STATUS 1
+#else
+#define HAS_ESP_BT_STATUS 0
+#endif
+
+#define SCAN_MINIMAL_MODE 0
 
 namespace {
 constexpr uint32_t kScanDurationSeconds = 15;
 constexpr uint32_t kScanPauseMs = 2000;
+constexpr size_t kMaxUniqueMacs = 200;
 
-struct BestDevice {
-  bool valid = false;
-  std::string addr;
-  std::string name;
-  int rssi = -127;
-};
+volatile uint32_t g_advs_total = 0;
+volatile uint32_t g_named = 0;
+volatile bool g_scan_running = false;
+volatile uint32_t g_scan_start_ms = 0;
+volatile uint32_t g_last_heartbeat_second = 0;
 
-struct ScanStats {
-  uint32_t count_total_advs = 0;
-  uint32_t count_with_name = 0;
-  std::vector<std::string> unique_addresses;
-  BestDevice best;
+String g_unique_macs[kMaxUniqueMacs];
+size_t g_unique_count = 0;
+bool g_unique_storage_full = false;
 
-  void clear() {
-    count_total_advs = 0;
-    count_with_name = 0;
-    unique_addresses.clear();
-    best = BestDevice{};
+int g_best_rssi = -127;
+String g_best_mac;
+String g_best_name;
+
+void printControllerStatus(const char* prefix) {
+#if HAS_ESP_BT_STATUS
+  const esp_bt_controller_status_t st = esp_bt_controller_get_status();
+  Serial.printf("%s controller_status=%d\n", prefix, static_cast<int>(st));
+#else
+  Serial.printf("%s controller_status=n/a\n", prefix);
+#endif
+}
+
+void resetRoundStats() {
+  g_advs_total = 0;
+  g_named = 0;
+  g_unique_count = 0;
+  g_unique_storage_full = false;
+  g_best_rssi = -127;
+  g_best_mac = "";
+  g_best_name = "";
+}
+
+bool rememberUnique(const String& mac) {
+  for (size_t i = 0; i < g_unique_count; ++i) {
+    if (g_unique_macs[i] == mac) {
+      return false;
+    }
   }
 
-  bool hasAddress(const std::string& addr) const {
-    for (const auto& item : unique_addresses) {
-      if (item == addr) {
-        return true;
+  if (g_unique_count < kMaxUniqueMacs) {
+    g_unique_macs[g_unique_count++] = mac;
+    return true;
+  }
+
+  g_unique_storage_full = true;
+  return false;
+}
+
+String buildServiceList(NimBLEAdvertisedDevice* dev) {
+  if (dev == nullptr) {
+    return "n/a";
+  }
+
+  const int svc_count = dev->getServiceUUIDCount();
+  if (svc_count <= 0) {
+    return "n/a";
+  }
+
+  String out;
+  for (int i = 0; i < svc_count; ++i) {
+    if (i > 0) {
+      out += ",";
+    }
+    out += String(dev->getServiceUUID(i).toString().c_str());
+  }
+  return out;
+}
+
+class DiagAdvertisedCallbacks : public NimBLEAdvertisedDeviceCallbacks {
+ public:
+  void onResult(NimBLEAdvertisedDevice* dev) override {
+    if (dev == nullptr) {
+      return;
+    }
+
+    g_advs_total++;
+
+    const int rssi = dev->getRSSI();
+    const String mac = String(dev->getAddress().toString().c_str());
+    const bool has_name = dev->haveName();
+    const String name = has_name ? String(dev->getName().c_str()) : "";
+    const String svc = buildServiceList(dev);
+
+    if (has_name) {
+      g_named++;
+    }
+
+    rememberUnique(mac);
+
+    if (g_best_mac.isEmpty() || rssi > g_best_rssi) {
+      g_best_rssi = rssi;
+      g_best_mac = mac;
+      g_best_name = name;
+    }
+
+    Serial.printf("[SCAN] adv rssi=%d mac=%s name=\"%s\" svc=%s\n", rssi, mac.c_str(),
+                  name.c_str(), svc.c_str());
+  }
+};
+
+DiagAdvertisedCallbacks g_adv_cb;
+
+void heartbeatTask(void*) {
+  while (true) {
+    if (g_scan_running) {
+      const uint32_t elapsed_s = (millis() - g_scan_start_ms) / 1000;
+      while (g_last_heartbeat_second < elapsed_s &&
+             g_last_heartbeat_second < kScanDurationSeconds) {
+        g_last_heartbeat_second++;
+        Serial.printf("[SCAN] t=%lus\n", static_cast<unsigned long>(g_last_heartbeat_second));
       }
     }
-    return false;
+
+    vTaskDelay(pdMS_TO_TICKS(100));
   }
-};
-
-ScanStats g_stats;
-bool g_scan_running = false;
-uint32_t g_round_number = 0;
-uint32_t g_next_scan_ms = 0;
-uint32_t g_scan_start_ms = 0;
-uint32_t g_last_heartbeat_second = 0;
-
-class DiagScanCallbacks : public NimBLEScanCallbacks {
- public:
-  void onResult(const NimBLEAdvertisedDevice* device) override {
-    (void)device;
-  }
-};
-
-DiagScanCallbacks g_scan_callbacks;
-
-std::string buildServiceList(const NimBLEAdvertisedDevice* device) {
-  std::string service_uuids;
-  const int svc_count = device->getServiceUUIDCount();
-  for (int i = 0; i < svc_count; ++i) {
-    if (!service_uuids.empty()) {
-      service_uuids += ",";
-    }
-    service_uuids += device->getServiceUUID(i).toString();
-  }
-  return service_uuids;
 }
 
-void printAndSummarize(const NimBLEScanResults& results) {
-  g_stats.clear();
+void configureScan(NimBLEScan* scan) {
+#if SCAN_MINIMAL_MODE
+  scan->setAdvertisedDeviceCallbacks(&g_adv_cb, true);
+  scan->setActiveScan(false);
+  scan->setMaxResults(0);
+  scan->clearResults();
+#else
+  scan->setAdvertisedDeviceCallbacks(&g_adv_cb, true);
+  scan->setActiveScan(true);
+  scan->setInterval(45);
+  scan->setWindow(15);
+  scan->setMaxResults(0);
+  scan->clearResults();
+#endif
+}
 
-  const uint32_t found = results.getCount();
-  Serial.printf("[SCAN] found=%lu\n", static_cast<unsigned long>(found));
+void printSummary(const NimBLEScanResults& res) {
+  const String best_id = g_best_name.isEmpty() ? g_best_mac : g_best_name;
 
-  for (uint32_t i = 0; i < found; ++i) {
-    const NimBLEAdvertisedDevice* device = results.getDevice(i);
-    if (device == nullptr) {
-      continue;
-    }
-
-    const std::string addr = device->getAddress().toString();
-    const int rssi = device->getRSSI();
-    const bool has_name = device->haveName();
-    const std::string name = has_name ? device->getName() : "";
-    const std::string service_uuids = buildServiceList(device);
-
-    g_stats.count_total_advs++;
-    if (has_name) {
-      g_stats.count_with_name++;
-    }
-    if (!g_stats.hasAddress(addr)) {
-      g_stats.unique_addresses.push_back(addr);
-    }
-    if (!g_stats.best.valid || rssi > g_stats.best.rssi) {
-      g_stats.best.valid = true;
-      g_stats.best.addr = addr;
-      g_stats.best.rssi = rssi;
-      g_stats.best.name = name;
-    }
-
-    Serial.printf("[SCAN] addr=%s rssi=%d name='%s' svcs=%s\n", addr.c_str(), rssi,
-                  name.c_str(), service_uuids.c_str());
-  }
-
-  if (g_stats.best.valid) {
-    Serial.printf("[SCAN] summary: advs=%lu unique=%u named=%lu best=%d\n",
-                  static_cast<unsigned long>(g_stats.count_total_advs),
-                  static_cast<unsigned int>(g_stats.unique_addresses.size()),
-                  static_cast<unsigned long>(g_stats.count_with_name), g_stats.best.rssi);
+  Serial.printf("[SCAN] found=%d\n", res.getCount());
+  if (!best_id.isEmpty()) {
+    Serial.printf("[SCAN] summary: advs=%lu unique=%u named=%lu best=%s/%d\n",
+                  static_cast<unsigned long>(g_advs_total),
+                  static_cast<unsigned int>(g_unique_count),
+                  static_cast<unsigned long>(g_named), best_id.c_str(), g_best_rssi);
   } else {
     Serial.printf("[SCAN] summary: advs=%lu unique=%u named=%lu best=n/a\n",
-                  static_cast<unsigned long>(g_stats.count_total_advs),
-                  static_cast<unsigned int>(g_stats.unique_addresses.size()),
-                  static_cast<unsigned long>(g_stats.count_with_name));
+                  static_cast<unsigned long>(g_advs_total),
+                  static_cast<unsigned int>(g_unique_count),
+                  static_cast<unsigned long>(g_named));
+  }
+
+  if (g_unique_storage_full) {
+    Serial.printf("[SCAN] note: unique MAC storage capped at %u\n",
+                  static_cast<unsigned int>(kMaxUniqueMacs));
+  }
+
+  if (g_advs_total == 0) {
+    Serial.println(
+        "[SCAN] ERROR: No advertisements received. Possible BLE controller/board/core "
+        "configuration issue.");
+    Serial.printf("[SCAN] heap=%u\n", ESP.getFreeHeap());
+    printControllerStatus("[SCAN]");
   }
 }
 
-void startRound() {
+void runScanRound() {
   NimBLEScan* scan = NimBLEDevice::getScan();
-  g_round_number++;
+  if (scan == nullptr) {
+    Serial.println("[SCAN] FATAL: BLE stack not available / init failed");
+    while (true) {
+      delay(1000);
+    }
+  }
+
+  resetRoundStats();
+  configureScan(scan);
+
   g_scan_running = true;
   g_scan_start_ms = millis();
   g_last_heartbeat_second = 0;
 
-  Serial.printf("[SCAN] round %lu start (15s)\n", static_cast<unsigned long>(g_round_number));
-  scan->start(kScanDurationSeconds, false, true);
-}
+#if SCAN_MINIMAL_MODE
+  NimBLEScanResults res = scan->start(10, false);
+#else
+  NimBLEScanResults res = scan->start(kScanDurationSeconds, false);
+#endif
 
-void maybePrintHeartbeat(uint32_t now_ms) {
-  if (!g_scan_running) {
-    return;
-  }
+  g_scan_running = false;
 
-  const uint32_t elapsed_s = (now_ms - g_scan_start_ms) / 1000;
-  while (g_last_heartbeat_second < elapsed_s && g_last_heartbeat_second < kScanDurationSeconds) {
+#if SCAN_MINIMAL_MODE
+  while (g_last_heartbeat_second < 10) {
+#else
+  while (g_last_heartbeat_second < kScanDurationSeconds) {
+#endif
     g_last_heartbeat_second++;
     Serial.printf("[SCAN] t=%lus\n", static_cast<unsigned long>(g_last_heartbeat_second));
   }
-}
 
-void finishRound() {
-  NimBLEScan* scan = NimBLEDevice::getScan();
-  if (scan->isScanning()) {
-    scan->stop();
-  }
-
-  const NimBLEScanResults& results = scan->getResults();
-  printAndSummarize(results);
+  printSummary(res);
   scan->clearResults();
-
-  g_scan_running = false;
-  g_next_scan_ms = millis() + kScanPauseMs;
 }
 
 }  // namespace
@@ -156,43 +220,28 @@ void finishRound() {
 void setup() {
   Serial.begin(115200);
   delay(200);
-  Serial.println();
+
   Serial.println("[SCAN] BLE scan diagnostics starting");
+  Serial.printf("[SCAN] heap=%u\n", ESP.getFreeHeap());
 
   NimBLEDevice::init("");
   NimBLEDevice::setPower(ESP_PWR_LVL_P9);
 
   NimBLEScan* scan = NimBLEDevice::getScan();
-  scan->setScanCallbacks(&g_scan_callbacks, false);
-  scan->setActiveScan(true);
-  scan->setInterval(45);
-  scan->setWindow(15);
-  scan->setDuplicateFilter(false);
-
-  g_next_scan_ms = millis();
-}
-
-void loop() {
-  const uint32_t now = millis();
-
-  if (!g_scan_running && now >= g_next_scan_ms) {
-    startRound();
-  }
-
-  maybePrintHeartbeat(now);
-
-  if (g_scan_running) {
-    NimBLEScan* scan = NimBLEDevice::getScan();
-    const uint32_t elapsed_ms = now - g_scan_start_ms;
-
-    if (!scan->isScanning() || elapsed_ms >= (kScanDurationSeconds * 1000UL + 1000UL)) {
-      while (g_last_heartbeat_second < kScanDurationSeconds) {
-        g_last_heartbeat_second++;
-        Serial.printf("[SCAN] t=%lus\n", static_cast<unsigned long>(g_last_heartbeat_second));
-      }
-      finishRound();
+  if (scan == nullptr) {
+    Serial.println("[SCAN] FATAL: BLE stack not available / init failed");
+    while (true) {
+      delay(1000);
     }
   }
 
-  delay(20);
+  Serial.println("[SCAN] NimBLE init OK");
+  printControllerStatus("[SCAN]");
+
+  xTaskCreatePinnedToCore(heartbeatTask, "scan_heartbeat", 3072, nullptr, 1, nullptr, 1);
+}
+
+void loop() {
+  runScanRound();
+  delay(kScanPauseMs);
 }
