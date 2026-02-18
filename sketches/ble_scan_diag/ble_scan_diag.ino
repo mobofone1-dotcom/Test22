@@ -12,6 +12,7 @@
 namespace {
 constexpr uint32_t kScanDurationSeconds = 15;
 constexpr uint32_t kScanPauseMs = 2000;
+constexpr uint32_t kScanWaitTimeoutMs = (kScanDurationSeconds + 5) * 1000;
 constexpr size_t kMaxUniqueMacs = 200;
 
 volatile uint32_t g_advs_total = 0;
@@ -19,6 +20,9 @@ volatile uint32_t g_named = 0;
 volatile bool g_scan_running = false;
 volatile uint32_t g_scan_start_ms = 0;
 volatile uint32_t g_last_heartbeat_second = 0;
+volatile bool g_scan_end_seen = false;
+volatile int g_scan_end_reason = 0;
+volatile uint32_t g_last_found_count = 0;
 
 String g_unique_macs[kMaxUniqueMacs];
 size_t g_unique_count = 0;
@@ -37,6 +41,17 @@ void printControllerStatus(const char* prefix) {
 #endif
 }
 
+void printNimBLEApiInfo() {
+#ifdef NIMBLE_CPP_VERSION
+  Serial.printf("[SCAN] NimBLE CPP version: %s\n", NIMBLE_CPP_VERSION);
+#elif defined(NIMBLE_VERSION)
+  Serial.printf("[SCAN] NimBLE version macro: %s\n", NIMBLE_VERSION);
+#else
+  Serial.println("[SCAN] NimBLE version macro: unknown");
+#endif
+  Serial.println("[SCAN] Using NimBLEScanCallbacks + start(duration, continue, restart)");
+}
+
 void resetRoundStats() {
   g_advs_total = 0;
   g_named = 0;
@@ -45,6 +60,9 @@ void resetRoundStats() {
   g_best_rssi = -127;
   g_best_mac = "";
   g_best_name = "";
+  g_scan_end_seen = false;
+  g_scan_end_reason = 0;
+  g_last_found_count = 0;
 }
 
 bool rememberUnique(const String& mac) {
@@ -63,7 +81,7 @@ bool rememberUnique(const String& mac) {
   return false;
 }
 
-String buildServiceList(NimBLEAdvertisedDevice* dev) {
+String buildServiceList(const NimBLEAdvertisedDevice* dev) {
   if (dev == nullptr) {
     return "n/a";
   }
@@ -83,9 +101,9 @@ String buildServiceList(NimBLEAdvertisedDevice* dev) {
   return out;
 }
 
-class DiagAdvertisedCallbacks : public NimBLEAdvertisedDeviceCallbacks {
+class DiagScanCallbacks : public NimBLEScanCallbacks {
  public:
-  void onResult(NimBLEAdvertisedDevice* dev) override {
+  void onResult(const NimBLEAdvertisedDevice* dev) override {
     if (dev == nullptr) {
       return;
     }
@@ -113,9 +131,16 @@ class DiagAdvertisedCallbacks : public NimBLEAdvertisedDeviceCallbacks {
     Serial.printf("[SCAN] adv rssi=%d mac=%s name=\"%s\" svc=%s\n", rssi, mac.c_str(),
                   name.c_str(), svc.c_str());
   }
+
+  void onScanEnd(const NimBLEScanResults& results, int reason) override {
+    g_last_found_count = results.getCount();
+    g_scan_end_reason = reason;
+    g_scan_end_seen = true;
+    g_scan_running = false;
+  }
 };
 
-DiagAdvertisedCallbacks g_adv_cb;
+DiagScanCallbacks g_scan_cb;
 
 void heartbeatTask(void*) {
   while (true) {
@@ -134,12 +159,12 @@ void heartbeatTask(void*) {
 
 void configureScan(NimBLEScan* scan) {
 #if SCAN_MINIMAL_MODE
-  scan->setAdvertisedDeviceCallbacks(&g_adv_cb, true);
+  scan->setScanCallbacks(&g_scan_cb, true);
   scan->setActiveScan(false);
   scan->setMaxResults(0);
   scan->clearResults();
 #else
-  scan->setAdvertisedDeviceCallbacks(&g_adv_cb, true);
+  scan->setScanCallbacks(&g_scan_cb, true);
   scan->setActiveScan(true);
   scan->setInterval(45);
   scan->setWindow(15);
@@ -148,10 +173,11 @@ void configureScan(NimBLEScan* scan) {
 #endif
 }
 
-void printSummary(const NimBLEScanResults& res) {
+void printSummary() {
   const String best_id = g_best_name.isEmpty() ? g_best_mac : g_best_name;
 
-  Serial.printf("[SCAN] found=%d\n", res.getCount());
+  Serial.printf("[SCAN] found=%u reason=%d\n", static_cast<unsigned int>(g_last_found_count),
+                g_scan_end_reason);
   if (!best_id.isEmpty()) {
     Serial.printf("[SCAN] summary: advs=%lu unique=%u named=%lu best=%s/%d\n",
                   static_cast<unsigned long>(g_advs_total),
@@ -167,6 +193,10 @@ void printSummary(const NimBLEScanResults& res) {
   if (g_unique_storage_full) {
     Serial.printf("[SCAN] note: unique MAC storage capped at %u\n",
                   static_cast<unsigned int>(kMaxUniqueMacs));
+  }
+
+  if (!g_scan_end_seen) {
+    Serial.println("[SCAN] ERROR: scan end callback was not called (API/runtime issue).");
   }
 
   if (g_advs_total == 0) {
@@ -195,23 +225,36 @@ void runScanRound() {
   g_last_heartbeat_second = 0;
 
 #if SCAN_MINIMAL_MODE
-  NimBLEScanResults res = scan->start(10, false);
+  const uint32_t duration_s = 10;
 #else
-  NimBLEScanResults res = scan->start(kScanDurationSeconds, false);
+  const uint32_t duration_s = kScanDurationSeconds;
 #endif
 
-  g_scan_running = false;
+  const bool started = scan->start(duration_s, false, true);
+  if (!started) {
+    g_scan_running = false;
+    Serial.println("[SCAN] ERROR: scan->start returned false");
+    printControllerStatus("[SCAN]");
+    return;
+  }
 
-#if SCAN_MINIMAL_MODE
-  while (g_last_heartbeat_second < 10) {
-#else
-  while (g_last_heartbeat_second < kScanDurationSeconds) {
-#endif
+  const uint32_t wait_started = millis();
+  while (g_scan_running && (millis() - wait_started) < kScanWaitTimeoutMs) {
+    delay(20);
+  }
+
+  if (g_scan_running) {
+    Serial.println("[SCAN] ERROR: scan timeout waiting for onScanEnd");
+    scan->stop();
+    g_scan_running = false;
+  }
+
+  while (g_last_heartbeat_second < duration_s) {
     g_last_heartbeat_second++;
     Serial.printf("[SCAN] t=%lus\n", static_cast<unsigned long>(g_last_heartbeat_second));
   }
 
-  printSummary(res);
+  printSummary();
   scan->clearResults();
 }
 
@@ -236,6 +279,7 @@ void setup() {
   }
 
   Serial.println("[SCAN] NimBLE init OK");
+  printNimBLEApiInfo();
   printControllerStatus("[SCAN]");
 
   xTaskCreatePinnedToCore(heartbeatTask, "scan_heartbeat", 3072, nullptr, 1, nullptr, 1);
